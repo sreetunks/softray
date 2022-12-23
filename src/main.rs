@@ -3,18 +3,24 @@ use winit::{
     event::{Event, WindowEvent},
     event_loop::{ControlFlow, EventLoop},
     window::WindowBuilder,
-	dpi::LogicalSize};
+	dpi::LogicalSize
+};
 use std::{
 	ops,
 	collections::HashMap,
-	vec::Vec
+	vec::Vec,
+	thread,
+	sync::Arc,
+	sync::Mutex,
+	sync::RwLock
 };
 
 #[derive(Copy, Clone)]
 struct Vec3 {
 	x : f32,
 	y : f32,
-	z : f32}
+	z : f32
+}
 
 impl Vec3 {
 	fn create(x : f32, y : f32, z : f32) -> Self { Vec3 {x, y, z} }
@@ -31,42 +37,48 @@ impl Vec3 {
 	fn normalize(self) -> Self {
 		let inv_len = self.magnitude().recip();
 		self * inv_len
-	}}
+	}
+}
 
 impl ops::Add<Vec3> for Vec3 {
 	type Output = Vec3;
 
-	fn add(self, _rhs : Vec3) -> Vec3 { Vec3 {x : self.x + _rhs.x, y : self.y + _rhs.y, z : self.z + _rhs.z} }}
+	fn add(self, _rhs : Vec3) -> Vec3 { Vec3 {x : self.x + _rhs.x, y : self.y + _rhs.y, z : self.z + _rhs.z} }
+}
 
 impl ops::Sub<Vec3> for Vec3 {
 	type Output = Self;
 
-	fn sub(self, _rhs : Self) -> Self { Self {x : self.x - _rhs.x, y : self.y - _rhs.y, z : self.z - _rhs.z} }}
+	fn sub(self, _rhs : Self) -> Self { Self {x : self.x - _rhs.x, y : self.y - _rhs.y, z : self.z - _rhs.z} }
+}
 
 impl ops::Mul<f32> for Vec3 {
 	type Output = Self;
 
-	fn mul(self, _rhs : f32) -> Self { Self {x : self.x * _rhs, y : self.y * _rhs, z : self.z * _rhs}}}
+	fn mul(self, _rhs : f32) -> Self { Self {x : self.x * _rhs, y : self.y * _rhs, z : self.z * _rhs}}
+}
 
 impl ops::Mul<Vec3> for Vec3 {
 	type Output = Self;
 
-	fn mul(self, _rhs : Vec3) -> Self { Self {x : self.x * _rhs.x, y : self.y * _rhs.y, z : self.z * _rhs.z } }}
+	fn mul(self, _rhs : Vec3) -> Self { Self {x : self.x * _rhs.x, y : self.y * _rhs.y, z : self.z * _rhs.z } }
+}
 
 struct Camera {
 	pos : Vec3,
 	lens_plane : f32,
 	size : f32,
+	aspect_ratio : f32,
 	x : Vec3,
 	y : Vec3,
 	z : Vec3
 }
 impl Camera {
-	fn create(pos : Vec3, size : f32, lens_plane : f32) -> Camera {
+	fn create(pos : Vec3, size : f32, aspect_ratio : f32, lens_plane : f32) -> Camera {
 		let z = (pos * -1.0).normalize();
 		let x = Vec3::create(0.0, -1.0, 0.0).cross(z).normalize();
 		let y = z.cross(x).normalize();
-		Camera { pos, lens_plane, size, x, y, z }
+		Camera { pos, lens_plane, size, aspect_ratio, x, y, z }
 	}
 
 	fn look_at(&mut self, target : Vec3) {
@@ -76,7 +88,7 @@ impl Camera {
 	}
 
 	fn get_world_pos(&self, screen_x : f32, screen_y : f32) -> Vec3 {
-		(self.x * screen_x * self.size) +
+		(self.x * screen_x * self.size * self.aspect_ratio) +
 		(self.y * screen_y * self.size) +
 		self.pos + (self.z * self.lens_plane)
 	}
@@ -169,7 +181,8 @@ impl World {
 	fn add_sphere(&mut self, pos : Vec3, radius : f32, material_id : u64) {
 		assert!(self.material_map.contains_key(&material_id));
 		self.spheres.push(Sphere::create(pos, radius, material_id));
-	}}
+	}
+}
 
 fn cast_ray(world : &World, orig: Vec3, dir : Vec3) -> Vec3 {
 	let mut orig = orig;
@@ -178,14 +191,16 @@ fn cast_ray(world : &World, orig: Vec3, dir : Vec3) -> Vec3 {
 	let mut num_bounces = 12;
 	let mut color = Vec3::create(0.0, 0.0, 0.0);
 	let mut atten = Vec3::create(1.0, 1.0, 1.0);
-	while num_bounces > 0 { 
+	while num_bounces > 0 {
 		let mut hit = RayCastHit {
 			position: Vec3::create(0.0, 0.0, 0.0),
 			normal	: Vec3::create(0.0, 0.0, 0.0),
-			distance: f32::INFINITY};
+			distance: f32::INFINITY
+		};
+		
 		let mut hit_material = world.material_map.get(&0).unwrap();
 
-		for plane in world.planes.iter() {
+		for plane in &world.planes {
 			if plane.has_contact(dir) {
 				let contact = plane.get_contact(orig, dir);
 				if contact.distance < hit.distance {
@@ -220,6 +235,39 @@ fn cast_ray(world : &World, orig: Vec3, dir : Vec3) -> Vec3 {
 	color
 }
 
+fn slice_draw(index : u32, world : &World, camera : &Camera, buffer : &mut[u32], width : u32, height : u32) {
+	let mut pixel_x = index / width;
+	let pixel_y = index % width;
+	let y = (-1.0 + 2.0 * (pixel_y as f32 / height as f32)) * 0.5;
+	for i in 0..width as usize {
+		const RAYS_PER_PIXEL : u32 = 64;
+
+		let mut color = Vec3::create(0.0, 0.0, 0.0);
+		for _ in 0..RAYS_PER_PIXEL {
+			let x = (-1.0 + 2.0 * (pixel_x as f32 / width as f32)) * 0.5;
+
+			let offset = (-1.0 + 2.0 * rand::random::<f32>(), -1.0 + 2.0 * rand::random::<f32>());
+			let offset = (offset.0 * 0.5 / width as f32, offset.1 * 0.5 / height as f32);
+
+			let film_point = camera.get_world_pos(x + offset.0, y + offset.1);
+
+			//color = color + (cast_ray(&world, camera.pos, (film_point - camera.pos).normalize()) * (1.0 / RAYS_PER_PIXEL as f32));
+			color = color + (cast_ray(&world, film_point, camera.z) * (1.0 / RAYS_PER_PIXEL as f32));
+		}
+
+		if color.x <= 0.0031308 { color.x = color.x * 12.92; }
+		else { color.x = (1.055 * color.x.powf(1.0/2.4)) - 0.055}
+		if color.y <= 0.0031308 { color.y = color.y * 12.92 }
+		else { color.y = (1.055 * color.y.powf(1.0/2.4)) - 0.055}
+		if color.z <= 0.0031308 { color.z = color.z * 12.92 }
+		else { color.z = (1.055 * color.z.powf(1.0/2.4)) - 0.055}
+
+		buffer[i] = (color.z * 255.0) as u32 | ((color.y * 255.0) as u32) << 8 | ((color.x * 255.0) as u32) << 16;
+
+		pixel_x += 1;
+	}
+}
+
 fn main() {
     let event_loop = EventLoop::new();
 	let builder = WindowBuilder::new();
@@ -227,80 +275,90 @@ fn main() {
 	window.set_inner_size(LogicalSize::new(1280.0f32, 720.0f32));
     let mut graphics_context = unsafe { GraphicsContext::new(window) }.unwrap();
 
+	let (width, height) = {
+		let size = graphics_context.window().inner_size();
+		(size.width, size.height)
+	};
+
+	let mut camera = Camera::create(Vec3::create(0.0, 6.0, 6.0), 5.0, width as f32 / height as f32, 1.0);
+	camera.look_at(Vec3::create(0.0, 0.0, 0.0));
+
+	let mut world = World::new();
+
+	world.add_material(Vec3::create(0.0, 0.0, 0.0), Vec3::create(0.392, 0.584, 0.929), 0.0);
+
+	let sun		= world.add_material(Vec3::create(0.0, 0.0, 0.0), Vec3::create(1.0, 1.0, 1.0), 0.0);
+	let mat1	= world.add_material(Vec3::create(0.5, 0.5, 0.5), Vec3::create(0.0, 0.0, 0.0), 0.2);
+	let mat2	= world.add_material(Vec3::create(0.5, 0.7, 0.3), Vec3::create(0.0, 0.0, 0.0), 0.95);
+	let mat3	= world.add_material(Vec3::create(0.95, 0.95, 0.95), Vec3::create(0.0, 0.0, 0.0), 1.0);
+	let mat4	= world.add_material(Vec3::create(0.8, 0.8, 0.8), Vec3::create(0.6, 0.0, 0.0), 0.6);
+
+	world.add_plane(Vec3::create(0.0, 1.0, 0.0), 0.0, mat1);
+	world.add_sphere(Vec3::create(0.0, 10.0, 0.0), 1.0, sun);
+	world.add_sphere(Vec3::create(0.0, 1.0, 0.0), 1.0, mat2);
+	world.add_sphere(Vec3::create(2.0, 0.0, 0.0), 1.0, mat3);
+	world.add_sphere(Vec3::create(-2.0, 1.0, 2.0), 1.0, mat4);
+
+	let buffer = Arc::new(Mutex::new(vec![0; (width * height) as usize]));
+	let redraw_lock = Arc::new(RwLock::new(false));
+	let draw_index = Arc::new(Mutex::new(Some(0)));
+	let camera = Arc::new(camera);
+	let world = Arc::new(world);
+
+	for _ in 0..7 {
+		let draw_index = Arc::clone(&draw_index);
+		let buffer = Arc::clone(&buffer);
+		let redraw_lock = Arc::clone(&redraw_lock);
+		let camera = Arc::clone(&camera);
+		let world = Arc::clone(&world);
+
+		std::thread::spawn(move || {
+			loop {
+				if !*(redraw_lock.read().unwrap()) { thread::yield_now(); }
+
+				let mut mutex = draw_index.lock().unwrap();
+				let draw_index = *mutex;
+				let slice : &mut [u32];
+				if let Some(index) = draw_index {
+					let mut buffer = buffer.lock().unwrap();
+					slice = buffer.split_at_mut(index as usize).1.split_at_mut(width as usize).1;
+
+					if index + 1 < height { *mutex = Some(index + 1); }
+					else { *mutex = None; }
+
+					drop(mutex);
+
+					let mut index = index;
+					for _ in 0..(height / 8) as usize {
+						slice_draw(index, &world, &camera, slice, width, height);
+						index += 1;
+					}
+				}
+			}
+		});
+	}
+
     event_loop.run(move |event, _, control_flow| {
-        *control_flow = ControlFlow::Wait;
+        *control_flow = ControlFlow::Poll;
         match event {
-            Event::RedrawRequested(window_id) if window_id == graphics_context.window().id() => {
-                let (width, height) = {
-                    let size = graphics_context.window().inner_size();
-                    (size.width, size.height)
-                };
+            Event::MainEventsCleared => {
+				if !*redraw_lock.read().unwrap() { *redraw_lock.write().unwrap() = true; }
 
-				let aspect_ratio = width as f32 / height as f32;
-				let mut camera = Camera::create(Vec3::create(0.0, 6.0, 6.0), 5.0, 1.0);
-				camera.look_at(Vec3::create(0.0, 0.0, 0.0));
-				let mut world = World::new();
+				let mutex = draw_index.lock().unwrap();
+				if let Some(_) = *mutex { return; }
 
-				world.add_material(Vec3::create(0.0, 0.0, 0.0), Vec3::create(0.392, 0.584, 0.929), 0.0);
+				let buffer = buffer.lock().unwrap();
+				graphics_context.set_buffer(&buffer, width as u16, height as u16);
+				graphics_context.window().request_redraw();
 
-				let sun		= world.add_material(Vec3::create(0.0, 0.0, 0.0), Vec3::create(1.0, 1.0, 1.0), 0.0);
-				let mat1	= world.add_material(Vec3::create(0.5, 0.5, 0.5), Vec3::create(0.0, 0.0, 0.0), 0.2);
-				let mat2	= world.add_material(Vec3::create(0.5, 0.7, 0.3), Vec3::create(0.0, 0.0, 0.0), 0.95);
-				let mat3	= world.add_material(Vec3::create(0.95, 0.95, 0.95), Vec3::create(0.0, 0.0, 0.0), 1.0);
-				let mat4	= world.add_material(Vec3::create(0.8, 0.8, 0.8), Vec3::create(0.6, 0.0, 0.0), 0.6);
-
-				world.add_plane(Vec3::create(0.0, 1.0, 0.0), 0.0, mat1);
-
-				world.add_sphere(Vec3::create(0.0, 10.0, 0.0), 1.0, sun);
-
-				world.add_sphere(Vec3::create(0.0, 1.0, 0.0), 1.0, mat2);
-				world.add_sphere(Vec3::create(2.0, 0.0, 0.0), 1.0, mat3);
-				world.add_sphere(Vec3::create(-2.0, 1.0, 2.0), 1.0, mat4);
-
-				let buffer = (0..((width * height) as usize))
-					.map(|index| {
-						let pixel_y = index as u32 / width;
-						let pixel_x = index as u32 % width;
-
-						let mut color = Vec3::create(0.0, 0.0, 0.0);
-
-						//if pixel_x != 640 || pixel_y != 360 { return 0 }
-
-						const RAYS_PER_PIXEL : u32 = 64;
-						for _ in 0..RAYS_PER_PIXEL {
-							let y = -1.0 + 2.0 *((pixel_y as f32) / (height as f32));
-							let x = -1.0 + 2.0 * ((pixel_x as f32) / (width as f32));
-
-							let offset = (-1.0 + 2.0 * rand::random::<f32>(), -1.0 + 2.0 * rand::random::<f32>());
-							let offset = (offset.0 * 0.5 / width as f32, offset.1 * 0.5 / height as f32);
-
-							let film_point = camera.get_world_pos((x * 0.5 * aspect_ratio) + offset.0, (y * 0.5) + offset.1);
-
-							//color = color + (cast_ray(&world, camera.pos, (film_point - camera.pos).normalize()) * (1.0 / RAYS_PER_PIXEL as f32));
-							color = color + (cast_ray(&world, film_point, camera.z) * (1.0 / RAYS_PER_PIXEL as f32));
-						}
-
-						if color.x <= 0.0031308 { color.x = color.x * 12.92 }
-						else { color.x = (1.055 * color.x.powf(1.0/2.4)) - 0.055}
-						if color.y <= 0.0031308 { color.y = color.y * 12.92 }
-						else { color.y = (1.055 * color.y.powf(1.0/2.4)) - 0.055}
-						if color.z <= 0.0031308 { color.z = color.z * 12.92 }
-						else { color.z = (1.055 * color.z.powf(1.0/2.4)) - 0.055}
-
-						(color.z * 255.0) as u32 |
-						((color.y * 255.0) as u32) << 8 |
-						((color.x * 255.0) as u32) << 16
-                    })
-                    .collect::<Vec<_>>();
-
-                graphics_context.set_buffer(&buffer, width as u16, height as u16);
-            }
+				*redraw_lock.write().unwrap() = false;
+			}
 
             Event::WindowEvent {
                 event: WindowEvent::CloseRequested,
                 window_id,
             } if window_id == graphics_context.window().id() => *control_flow = ControlFlow::Exit,
-            _ => (),
+			_ => (),
         }
     });
 }
